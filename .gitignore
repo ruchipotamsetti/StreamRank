@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+
+# Conda
+*.conda
+*.tar.bz2
+
+# Streamlit
+.streamlit/
+
+# OS
+.DS_Store
+Thumbs.db
