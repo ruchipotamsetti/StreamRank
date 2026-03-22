@@ -143,7 +143,7 @@ def get_recommendations(user_id: str, top_n: int = 5):
         return json.loads(cached)
 
     # Cache miss — compute fresh recommendations
-    print(f"[Cache] MISS → {redis_key} — computing...")
+    print(f"[Cache] MISS → {redis_key}: computing...")
     recs = recommend(user_id, top_n)
 
     # Store in Redis for 60 seconds (TTL)
