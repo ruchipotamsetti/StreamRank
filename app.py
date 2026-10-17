@@ -3,7 +3,7 @@ import threading
 import time
 import redis as _redis
 from producer import send_click, CATALOGUE, ITEMS, USERS, GENRES, GENRE_MAP, TYPE_MAP
-from consumer import start_consumer_thread, click_matrix
+from consumer import start_consumer_thread, click_matrix, wait_until_applied
 from recommender import get_recommendations
 
 # ── Page config ───────────────────────────────────────────────
@@ -82,7 +82,10 @@ with col1:
         for entry in type_items:
             title = entry["title"]
             if st.button(title, key=f"btn_{title}", use_container_width=True):
-                send_click(selected_user, title)
+                sent = send_click(selected_user, title)
+                # Don't recompute until the consumer has applied this click,
+                # or the recs below (and their cache entry) would miss it
+                wait_until_applied(sent)
                 st.session_state.last_clicked = title
                 log_entry = (
                     f"[{time.strftime('%H:%M:%S')}] "

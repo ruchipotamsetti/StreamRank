@@ -20,6 +20,8 @@ from unittest import mock
 import numpy as np
 import pytest
 import redis
+from kafka import TopicPartition
+from kafka.producer.future import RecordMetadata
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, ROOT)
@@ -144,8 +146,9 @@ class _Stop(Exception):
 
 
 class _Msg:
-    def __init__(self, value):
+    def __init__(self, value, offset=0):
         self.value = value
+        self.offset = offset
 
 
 class _ScriptedConsumer:
@@ -153,8 +156,10 @@ class _ScriptedConsumer:
     Feeds a fixed list of events, either by iteration (baseline) or by
     poll() in uneven batches (batched consumer), then raises _Stop.
     """
+    TP = TopicPartition("user-clicks", 0)
+
     def __init__(self, events, batch_sizes=(1, 7, 64, 3, 500)):
-        self.msgs = [_Msg(e) for e in events]
+        self.msgs = [_Msg(e, offset) for offset, e in enumerate(events)]
         self.batch_sizes = batch_sizes
 
     def __iter__(self):
@@ -168,7 +173,7 @@ class _ScriptedConsumer:
         if max_records:
             size = min(size, max_records)
         batch, self.msgs = self.msgs[:size], self.msgs[size:]
-        return {"tp": batch} if batch else {}
+        return {self.TP: batch} if batch else {}
 
 
 def _events(n, seed):
@@ -208,3 +213,75 @@ def test_consumer_identical(rdb, n_events):
         cur.consumer, cur.cache = real
     assert c_redis == b_redis
     assert c_mem == b_mem
+
+
+# ── consumer: cache invalidation + read-your-writes ──────────
+def _click(user, item):
+    return {"user_id": user, "item_id": item, "timestamp": 0,
+            "action": "click"}
+
+
+def test_consumer_invalidates_recs_on_write(rdb):
+    """
+    Recs cached before a click is applied must not outlive it: the consumer
+    deletes recs:{user} for every user whose clicks it wrote, and leaves
+    other users' cached recs alone.
+    """
+    cur, rec = load_current("consumer"), load_current("recommender")
+    real = (cur.consumer, cur.cache, rec.cache)
+    rdb.flushdb()
+    rdb.hset("clicks:user_1", mapping={"item_a": 1})
+    rdb.hset("clicks:user_2", mapping={"item_a": 1, "item_b": 1})
+    rdb.hset("clicks:user_3", mapping={"item_c": 1})
+    try:
+        rec.cache = rdb
+        # The race: recs computed and cached before the consumer catches up
+        stale = rec.get_recommendations("user_1")
+        assert [item for item, _ in stale] == ["item_b"]
+        rec.get_recommendations("user_3")
+
+        cur.consumer = _ScriptedConsumer([
+            _click("user_1", "item_c"),
+            {"user_id": "user_9"},                      # malformed
+            _click("user_1", "item_b"),
+        ])
+        cur.cache = rdb
+        with pytest.raises(_Stop):
+            cur.consume()
+
+        assert not rdb.exists("recs:user_1")            # invalidated
+        assert rdb.exists("recs:user_3")                # untouched
+        assert rdb.hgetall("clicks:user_1") == {
+            "item_a": "1", "item_b": "1", "item_c": "1"}
+        # Next read recomputes from the new counts instead of the stale list
+        assert rec.get_recommendations("user_1") == []
+    finally:
+        cur.consumer, cur.cache, rec.cache = real
+
+
+def test_wait_until_applied(rdb):
+    """send_click's RecordMetadata is visible once the consumer applied it."""
+    cur = load_current("consumer")
+    real = (cur.consumer, cur.cache)
+    rdb.flushdb()
+    tp = _ScriptedConsumer.TP
+    meta = lambda offset: RecordMetadata(tp.topic, tp.partition, tp,
+                                         offset, -1, None, -1, -1, -1)
+    try:
+        cur.cache = rdb
+        assert not cur.wait_until_applied(meta(0), timeout=0.01)
+
+        cur.consumer = _ScriptedConsumer(
+            [_click("user_1", "item_a"), _click("user_1", "item_b"),
+             {"user_id": "user_1", "item_id": "item_c", "action": "hover"}],
+            batch_sizes=(2,))
+        with pytest.raises(_Stop):
+            cur.consume()
+
+        # Offsets of skipped events count as applied too
+        assert rdb.get(cur.applied_key(tp.topic, tp.partition)) == "2"
+        assert cur.wait_until_applied(meta(1), timeout=0.01)
+        assert cur.wait_until_applied(meta(2), timeout=0.01)
+        assert not cur.wait_until_applied(meta(3), timeout=0.01)
+    finally:
+        cur.consumer, cur.cache = real

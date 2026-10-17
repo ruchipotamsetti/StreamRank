@@ -3,6 +3,7 @@ from collections import defaultdict
 import json
 import redis
 import threading
+import time
 
 # ── Connections ───────────────────────────────────────────────
 consumer = KafkaConsumer(
@@ -23,6 +24,11 @@ click_matrix = defaultdict(lambda: defaultdict(int))
 
 MAX_BATCH = 500   # max events per poll / Redis pipeline
 
+def applied_key(topic, partition):
+    # Last Kafka offset whose click is in Redis. Deliberately outside the
+    # clicks:* namespace so the recommender never reads it as a user.
+    return f"applied:{topic}:{partition}"
+
 # ── Core consume loop ─────────────────────────────────────────
 def consume():
     print("[Consumer] Listening for events on 'user-clicks'...\n")
@@ -33,8 +39,9 @@ def consume():
         batches = consumer.poll(timeout_ms=1000, max_records=MAX_BATCH)
         pipe = cache.pipeline(transaction=False)
         pending = 0
+        touched_users = set()
 
-        for records in batches.values():
+        for tp, records in batches.items():
             for message in records:
                 event = message.value
 
@@ -57,12 +64,42 @@ def consume():
 
                 # Queue the Redis update
                 pipe.hincrby(f"clicks:{user_id}", item_id, 1)
+                touched_users.add(user_id)
                 pending += 1
 
+            # Queued after the HINCRBYs, so once a reader sees this offset
+            # every click up to it is already applied.
+            if records:
+                pipe.set(applied_key(tp.topic, tp.partition), records[-1].offset)
+
+        # Invalidate on write: drop cached recs of every user whose clicks
+        # changed, after the HINCRBYs, so recs computed from the old counts
+        # don't survive for the rest of their 60s TTL.
+        for user_id in touched_users:
+            pipe.delete(f"recs:{user_id}")
+
         # Sync the whole batch to Redis
-        if pending:
+        if len(pipe):
             pipe.execute()
+        if pending:
             print(f"[Cache] Updated Redis → {pending} click(s)")
+
+# ── Read-your-writes for the app ─────────────────────────────
+def wait_until_applied(record_metadata, timeout=2.0):
+    """
+    Block until the consumer has written the click sent as
+    record_metadata (returned by producer.send_click) to Redis.
+    Returns False on timeout, e.g. if the consumer isn't running.
+    """
+    key = applied_key(record_metadata.topic, record_metadata.partition)
+    deadline = time.perf_counter() + timeout
+    while True:
+        applied = cache.get(key)
+        if applied is not None and int(applied) >= record_metadata.offset:
+            return True
+        if time.perf_counter() >= deadline:
+            return False
+        time.sleep(0.001)
 
 # ── Run consumer in a background thread ──────────────────────
 def start_consumer_thread():

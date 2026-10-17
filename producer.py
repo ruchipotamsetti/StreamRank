@@ -108,9 +108,10 @@ def send_click(user_id: str, item_id: str):
         "timestamp": time.time(),
         "action":   "click"
     }
-    producer.send(TOPIC, value=event)
+    future = producer.send(TOPIC, value=event)
     producer.flush()
     print(f"[Producer] Sent → {event}")
+    return future.get()     # RecordMetadata: topic, partition, offset
 
 # ── Simulation mode ───────────────────────────────────────────
 if __name__ == "__main__":

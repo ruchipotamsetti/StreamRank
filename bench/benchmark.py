@@ -286,8 +286,9 @@ def run_e2e():
     print(f"  send_click() (produce+flush)   {fmt(ss)}")
     print(f"  click → visible in Redis       {fmt(is_)}")
 
-    # 3b. The app's click flow: send_click → delete recs → get_recommendations
-    #     immediately. Is the new click in the matrix the model reads?
+    # 3b. The app's click flow: send_click → wait until the consumer applied
+    #     it → delete recs → get_recommendations. Is the new click in the
+    #     matrix the model reads?
     real_loader = rec.load_click_matrix
     snapshot = {}
 
@@ -297,14 +298,15 @@ def run_e2e():
         return m, a
     rec.load_click_matrix = recording_loader
 
-    flow_t, stale = [], 0
+    flow_t, stale, timeouts = [], 0, 0
     trials = 200
     try:
         for _ in range(trials):
             u, it = rng.choice(users), rng.choice(items)
             before = int(r.hget(f"clicks:{u}", it) or 0)
             t0 = time.perf_counter_ns()
-            producer.send_click(u, it)
+            sent = producer.send_click(u, it)
+            timeouts += not consumer.wait_until_applied(sent)
             r.delete(f"recs:{u}")
             rec.get_recommendations(u)
             flow_t.append(time.perf_counter_ns() - t0)
@@ -318,7 +320,7 @@ def run_e2e():
     print(f"  app flow (click → fresh recs)  {fmt(fs)}")
     print(f"  stale reads: {stale}/{trials} ({100 * stale / trials:.1f}%) — "
           f"recs computed before the consumer applied the click "
-          f"(and then cached for 60s)")
+          f"(and then cached for 60s); {timeouts} wait timeouts")
 
     # 3c. Throughput: blast N events, measure produce rate + drain time
     N = 20_000
@@ -343,6 +345,7 @@ def run_e2e():
     RESULTS["e2e"] = {
         "send_click": ss, "ingest": is_, "app_flow": fs,
         "stale_reads": stale, "stale_trials": trials,
+        "wait_timeouts": timeouts,
         "throughput": {"events": N, "applied": done,
                        "produce_s": t_prod, "end_to_end_s": t_all},
     }
