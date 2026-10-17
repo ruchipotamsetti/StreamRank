@@ -21,37 +21,48 @@ TOPIC = 'user-clicks'
 # Example:   { "user_3": { "Python Tutorial": 4, "Docker Guide": 2 } }
 click_matrix = defaultdict(lambda: defaultdict(int))
 
-# ── Helper: push updated counts to Redis ─────────────────────
-def update_redis(user_id: str, item_id: str):
-    redis_key = f"clicks:{user_id}"
-    cache.hincrby(redis_key, item_id, 1)
-    print(f"[Cache] Updated Redis → {redis_key} | {item_id}")
+MAX_BATCH = 500   # max events per poll / Redis pipeline
 
 # ── Core consume loop ─────────────────────────────────────────
 def consume():
     print("[Consumer] Listening for events on 'user-clicks'...\n")
-    for message in consumer:
-        event = message.value
+    while True:
+        # poll() returns as soon as any records are available, so a single
+        # click is still written right away; under load, events arrive in
+        # batches and are synced to Redis in one pipelined round trip.
+        batches = consumer.poll(timeout_ms=1000, max_records=MAX_BATCH)
+        pipe = cache.pipeline(transaction=False)
+        pending = 0
 
-        user_id  = event.get("user_id")
-        item_id  = event.get("item_id")
-        action   = event.get("action")
+        for records in batches.values():
+            for message in records:
+                event = message.value
 
-        if not user_id or not item_id:
-            print(f"[Consumer] Skipping malformed event: {event}")
-            continue
+                user_id  = event.get("user_id")
+                item_id  = event.get("item_id")
+                action   = event.get("action")
 
-        if action != "click":
-            continue
+                if not user_id or not item_id:
+                    print(f"[Consumer] Skipping malformed event: {event}")
+                    continue
 
-        # Update in-memory matrix
-        click_matrix[user_id][item_id] += 1
+                if action != "click":
+                    continue
 
-        print(f"[Consumer] Received → user: {user_id} | item: {item_id} | "
-              f"total clicks: {click_matrix[user_id][item_id]}")
+                # Update in-memory matrix
+                click_matrix[user_id][item_id] += 1
 
-        # Sync to Redis
-        update_redis(user_id, item_id)
+                print(f"[Consumer] Received → user: {user_id} | item: {item_id} | "
+                      f"total clicks: {click_matrix[user_id][item_id]}")
+
+                # Queue the Redis update
+                pipe.hincrby(f"clicks:{user_id}", item_id, 1)
+                pending += 1
+
+        # Sync the whole batch to Redis
+        if pending:
+            pipe.execute()
+            print(f"[Cache] Updated Redis → {pending} click(s)")
 
 # ── Run consumer in a background thread ──────────────────────
 def start_consumer_thread():
