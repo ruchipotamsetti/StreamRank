@@ -89,13 +89,12 @@ def recommend(user_id: str, top_n: int = 5):
 
     np_matrix, users = build_numpy_matrix(matrix, all_items)
 
-    # Compute cosine similarity between all users
-    # Result is a (num_users x num_users) matrix
-    # similarity[i][j] = how similar user i is to user j (0.0 → 1.0)
-    similarity_matrix = cosine_similarity(np_matrix)
-
+    # Cosine similarity between this user and every user (0.0 → 1.0).
+    # Only this user's row is needed, so skip the full users x users matrix.
     user_index = users.index(user_id)
-    similarity_scores = similarity_matrix[user_index]   # this user vs all others
+    similarity_scores = cosine_similarity(
+        np_matrix[user_index:user_index + 1], np_matrix
+    )[0]                                                 # this user vs all others
 
     # Score each item based on how much similar users clicked it
     item_scores = defaultdict(float)
