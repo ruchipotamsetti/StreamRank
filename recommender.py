@@ -17,12 +17,18 @@ def load_click_matrix():
         matrix : { user_id: { item_id: click_count } }
         all_items : sorted list of every unique item
     """
-    keys = cache.keys('clicks:*')
+    # SCAN instead of KEYS so Redis isn't blocked on large keyspaces,
+    # then fetch every hash in one pipelined round trip instead of N.
+    keys = list(cache.scan_iter(match='clicks:*', count=1000))
+    pipe = cache.pipeline(transaction=False)
+    for key in keys:
+        pipe.hgetall(key)
+    all_clicks = pipe.execute()
+
     matrix = {}
 
-    for key in keys:
+    for key, clicks in zip(keys, all_clicks):
         user_id = key.split(':')[1]           # "clicks:user_3" → "user_3"
-        clicks  = cache.hgetall(key)          # { "Python Tutorial": "4", ... }
         matrix[user_id] = {
             item: int(count)
             for item, count in clicks.items()
