@@ -4,6 +4,18 @@ __pycache__/
 *.egg-info/
 .env
 
+.pytest_cache/
+venv/
+.venv/
+
+# Benchmark output (regenerated on every run, machine-specific)
+bench/results*.json
+bench/report/runs/
+
+# Claude Code (local worktrees and personal settings)
+.claude/worktrees/
+.claude/settings.local.json
+
 # Conda
 *.conda
 *.tar.bz2
